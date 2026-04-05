@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, Body
+from fastapi import FastAPI, Depends, HTTPException, Body, Request
 from sqlalchemy.orm import Session
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jose import jwt, JWTError
@@ -7,6 +7,8 @@ from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import declarative_base, sessionmaker
 from pydantic import BaseModel, EmailStr
 from datetime import datetime, timedelta
+from typing import Dict
+import time
 
 # ========================
 # DATABASE SETUP
@@ -58,6 +60,22 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 security = HTTPBearer()
 
+# ========================
+# TOKEN BLACKLIST (for revocation)
+# ========================
+token_blacklist = set()
+
+# ========================
+# RATE LIMITING STORAGE
+# ========================
+# Simple memory-based counter: {user_email: [timestamps]}
+rate_limit_store: Dict[str, list] = {}
+RATE_LIMIT = 5        # 5 requests
+RATE_LIMIT_WINDOW = 60  # per 60 seconds
+
+# ========================
+# HELPER FUNCTIONS
+# ========================
 def hash_password(password: str):
     return pwd_context.hash(password)
 
@@ -72,14 +90,28 @@ def create_access_token(data: dict):
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     token = credentials.credentials
+    if token in token_blacklist:
+        raise HTTPException(status_code=401, detail="Token has been revoked")
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email = payload.get("sub")
         if email is None:
             raise HTTPException(status_code=401, detail="Invalid token")
+        # Rate limiting check
+        check_rate_limit(email)
         return email
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+def check_rate_limit(user_email: str):
+    now = time.time()
+    timestamps = rate_limit_store.get(user_email, [])
+    # Remove old timestamps outside the window
+    timestamps = [ts for ts in timestamps if now - ts < RATE_LIMIT_WINDOW]
+    if len(timestamps) >= RATE_LIMIT:
+        raise HTTPException(status_code=429, detail="Too many requests. Try again later.")
+    timestamps.append(now)
+    rate_limit_store[user_email] = timestamps
 
 # ========================
 # FASTAPI APP
@@ -129,11 +161,7 @@ def login(user: UserLogin, db: Session = Depends(get_db)):
 # ========================
 @app.get("/users/me")
 def validate_token(current_user: str = Depends(get_current_user)):
-    return {
-        "status": "success",
-        "message": "Token is valid",
-        "user_email": current_user
-    }
+    return {"status": "success", "message": "Token is valid", "user_email": current_user}
 
 # ========================
 # TASK 5: USER PROFILE MANAGEMENT
@@ -154,20 +182,24 @@ def update_user_profile(
     user = db.query(User).filter(User.email == current_user).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
-
-    # Update email
     if profile.email:
         if db.query(User).filter(User.email == profile.email).first():
             raise HTTPException(status_code=400, detail="Email already registered")
         user.email = profile.email
-
-    # Update password
     if profile.password:
         user.password = hash_password(profile.password)
-
     db.commit()
     db.refresh(user)
     return {"message": "Profile updated successfully", "email": user.email}
+
+# ========================
+# TASK 6: LOGOUT / TOKEN REVOCATION
+# ========================
+@app.post("/logout")
+def logout(current_user: str = Depends(get_current_user), credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    token_blacklist.add(token)
+    return {"message": "Logged out successfully. Token revoked."}
 
 # ========================
 # OPTIONAL PROTECTED ROUTE

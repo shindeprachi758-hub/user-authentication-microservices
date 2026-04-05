@@ -1,16 +1,93 @@
-from fastapi import FastAPI, Depends, HTTPException
+from fastapi import FastAPI, Depends, HTTPException, Body
 from sqlalchemy.orm import Session
-from app.database import SessionLocal, engine
-from app import models, schemas, auth
-from app.auth import get_current_user
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from jose import jwt, JWTError
+from passlib.context import CryptContext
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import declarative_base, sessionmaker
+from pydantic import BaseModel, EmailStr
+from datetime import datetime, timedelta
 
-# Create database tables
-models.Base.metadata.create_all(bind=engine)
+# ========================
+# DATABASE SETUP
+# ========================
+DATABASE_URL = "sqlite:///./test.db"
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
 
+# ========================
+# MODELS
+# ========================
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, unique=True, index=True)
+    password = Column(String)
+
+Base.metadata.create_all(bind=engine)
+
+# ========================
+# SCHEMAS
+# ========================
+class UserCreate(BaseModel):
+    email: EmailStr
+    password: str
+
+class UserLogin(BaseModel):
+    email: EmailStr
+    password: str
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
+
+class UserProfileUpdate(BaseModel):
+    email: EmailStr | None = None
+    password: str | None = None
+
+class UserProfileResponse(BaseModel):
+    email: EmailStr
+
+# ========================
+# AUTHENTICATION / JWT
+# ========================
+SECRET_KEY = "mysecretkey"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
+    token = credentials.credentials
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if email is None:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        return email
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+# ========================
+# FASTAPI APP
+# ========================
 app = FastAPI()
 
 # ========================
-# DB Dependency
+# DB DEPENDENCY
 # ========================
 def get_db():
     db = SessionLocal()
@@ -20,63 +97,81 @@ def get_db():
         db.close()
 
 # ========================
-# REGISTER (Task 2)
+# TASK 2: REGISTER
 # ========================
 @app.post("/register")
-def register(user: schemas.UserCreate, db: Session = Depends(get_db)):
-    existing_user = db.query(models.User).filter(models.User.email == user.email).first()
+def register(user: UserCreate, db: Session = Depends(get_db)):
+    existing_user = db.query(User).filter(User.email == user.email).first()
     if existing_user:
         raise HTTPException(status_code=400, detail="Email already registered")
-
-    hashed_password = auth.hash_password(user.password)
-
-    new_user = models.User(
-        email=user.email,
-        password=hashed_password
-    )
-
+    hashed_password = hash_password(user.password)
+    new_user = User(email=user.email, password=hashed_password)
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-
     return {"message": "User registered successfully"}
 
 # ========================
-# LOGIN (Task 3)
+# TASK 3: LOGIN
 # ========================
-@app.post("/login", response_model=schemas.Token)
-def login(user: schemas.UserLogin, db: Session = Depends(get_db)):
-    db_user = db.query(models.User).filter(models.User.email == user.email).first()
+@app.post("/login", response_model=Token)
+def login(user: UserLogin, db: Session = Depends(get_db)):
+    db_user = db.query(User).filter(User.email == user.email).first()
     if not db_user:
         raise HTTPException(status_code=400, detail="Invalid email")
-
-    if not auth.verify_password(user.password, db_user.password):
+    if not verify_password(user.password, db_user.password):
         raise HTTPException(status_code=400, detail="Invalid password")
-
-    token = auth.create_access_token(data={"sub": user.email})
-
-    return {
-        "access_token": token,
-        "token_type": "bearer"
-    }
+    token = create_access_token(data={"sub": user.email})
+    return {"access_token": token, "token_type": "bearer"}
 
 # ========================
-# PROTECTED ROUTE (Optional)
-# ========================
-@app.get("/protected")
-def protected_route(current_user: str = Depends(get_current_user)):
-    return {"message": f"Hello {current_user}"}
-
-# ========================
-# TASK 4: TOKEN VALIDATION ENDPOINT
+# TASK 4: TOKEN VALIDATION
 # ========================
 @app.get("/users/me")
 def validate_token(current_user: str = Depends(get_current_user)):
-    """
-    Validate JWT token and return logged-in user info.
-    """
     return {
         "status": "success",
         "message": "Token is valid",
         "user_email": current_user
     }
+
+# ========================
+# TASK 5: USER PROFILE MANAGEMENT
+# ========================
+@app.get("/users/profile", response_model=UserProfileResponse)
+def get_user_profile(current_user: str = Depends(get_current_user), db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == current_user).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return {"email": user.email}
+
+@app.put("/users/profile")
+def update_user_profile(
+    profile: UserProfileUpdate = Body(...),
+    current_user: str = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    user = db.query(User).filter(User.email == current_user).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Update email
+    if profile.email:
+        if db.query(User).filter(User.email == profile.email).first():
+            raise HTTPException(status_code=400, detail="Email already registered")
+        user.email = profile.email
+
+    # Update password
+    if profile.password:
+        user.password = hash_password(profile.password)
+
+    db.commit()
+    db.refresh(user)
+    return {"message": "Profile updated successfully", "email": user.email}
+
+# ========================
+# OPTIONAL PROTECTED ROUTE
+# ========================
+@app.get("/protected")
+def protected_route(current_user: str = Depends(get_current_user)):
+    return {"message": f"Hello {current_user}"}
